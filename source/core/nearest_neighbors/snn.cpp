@@ -15,9 +15,24 @@
 #include <limits>
 #include <numeric>
 
-/* Query block size for the OpenMP loop; matches the brute-force kernel's
-   X_test blocking so the two paths have comparable threading granularity. */
-#define SNN_QUERY_BLOCK_SIZE da_int(256)
+/* Query blocking parameters.
+
+   Queries are sorted by projection and grouped into blocks that are processed
+   with a single distance-kernel call over the union of their candidate bands.
+   The block is closed once the block's projection span exceeds
+   SNN_SPAN_FACTOR * band, which bounds the union band at
+   (SNN_SPAN_FACTOR + 2) * band against an individual band of 2 * band -- i.e.
+   a bounded fraction of wasted distances. A fixed block size cannot do this:
+   at small radii a fixed block spans a large part of the projection range, so
+   its union band covers a large fraction of the index and almost all computed
+   distances are discarded.
+
+   SNN_D_BUDGET caps the number of entries in the distance block so it stays
+   cache-resident; blocks whose union band is large are processed in
+   sub-chunks of queries rather than as one huge matrix. */
+#define SNN_MAX_QUERY_BLOCK da_int(256)
+#define SNN_SPAN_FACTOR T(1.0)
+#define SNN_D_BUDGET da_int(131072)
 
 namespace ARCH {
 
@@ -217,38 +232,60 @@ da_status snn_index<T>::radius_neighbors(
               [&qs](da_int a, da_int b) { return qs[a] < qs[b]; });
 
     /* ------------------------------------------------------------------
-     * 2. Block the sorted queries; one thread owns one block, so each
-     *    query is written by exactly one thread and no result merging is
-     *    needed (unlike the brute kernel, whose training-side blocking
-     *    splits a query's neighbours across threads).
+     * 2. Group the sorted queries into blocks whose projection span is at
+     *    most SNN_SPAN_FACTOR * band, so each block's union band stays
+     *    within a bounded factor of an individual query's band.
      * ------------------------------------------------------------------ */
-    da_int qblock_size = std::min(SNN_QUERY_BLOCK_SIZE, n_queries);
-    da_int qblock_rem, n_qblocks;
-    ARCH::da_utils::blocking_scheme(n_queries, qblock_size, n_qblocks,
-                                    qblock_rem);
+    std::vector<da_int> block_start;
+    try {
+        block_start.reserve(64);
+        block_start.push_back(0);
+    } catch (std::bad_alloc const &) {
+        return da_error(err, da_status_memory_error, // LCOV_EXCL_LINE
+                        "Memory allocation failed.");
+    }
+    {
+        da_int i = 0;
+        while (i < n_queries) {
+            T base = qs[qorder[i]];
+            da_int j = i + 1;
+            while (j < n_queries && (j - i) < SNN_MAX_QUERY_BLOCK &&
+                   (qs[qorder[j]] - base) <= SNN_SPAN_FACTOR * band)
+                j++;
+            try {
+                block_start.push_back(j);
+            } catch (std::bad_alloc const &) {
+                return da_error(err, da_status_memory_error, // LCOV_EXCL_LINE
+                                "Memory allocation failed.");
+            }
+            i = j;
+        }
+    }
+    da_int n_qblocks = static_cast<da_int>(block_start.size()) - 1;
     da_int n_threads = ARCH::da_utils::get_n_threads_loop(n_qblocks);
 
     da_int threading_error = 0;
 
-    /* Locals for the shared clause (avoids member variables in OpenMP
-       data-sharing clauses). */
+    /* Locals for the OpenMP data-sharing clause. */
     const T *scores_ptr = scores.data();
     const T *Xs_ptr = X_sorted.data();
     const da_int *perm_ptr = perm.data();
+    const da_int *bstart_ptr = block_start.data();
     da_int ns = n_samples, nf = n_features;
     T minkowski_p = this->p;
     da_metric metric = this->internal_metric;
 
 #pragma omp parallel num_threads(n_threads) default(none)                        \
     shared(threading_error, rnn_indices, rnn_distances, return_distances,        \
-               qblock_size, qblock_rem, n_qblocks, n_queries, qs, qorder,        \
-               scores_ptr, Xs_ptr, perm_ptr, ns, nf, minkowski_p, metric,        \
-               band, working_radius, X_test, ldx_test)
+               n_qblocks, qs, qorder, bstart_ptr, scores_ptr, Xs_ptr, perm_ptr,  \
+               ns, nf, minkowski_p, metric, band, working_radius, X_test,        \
+               ldx_test)
     {
         da_int local_error = 0;
         std::vector<T> Qbuf, D;
         try {
-            Qbuf.resize(static_cast<size_t>(qblock_size) * nf);
+            Qbuf.resize(static_cast<size_t>(SNN_MAX_QUERY_BLOCK) * nf);
+            D.resize(static_cast<size_t>(SNN_D_BUDGET));
         } catch (std::bad_alloc const &) {
 #pragma omp atomic write
             threading_error = 1;
@@ -261,14 +298,11 @@ da_status snn_index<T>::radius_neighbors(
             if (local_error != 0)
                 continue;
 
-            da_int local_block = qblock_size;
-            if (b == n_qblocks - 1 && qblock_rem > 0)
-                local_block = qblock_rem;
-            da_int qstart = b * qblock_size;
+            da_int qstart = bstart_ptr[b];
+            da_int local_block = bstart_ptr[b + 1] - qstart;
 
-            /* Union band of this block: the queries are sorted by
-               projection, so the block minimum and maximum are its first
-               and last members. */
+            /* Union band of this block. Queries are sorted by projection, so
+               the block's extremes are its first and last members. */
             T lo_val = qs[qorder[qstart]] - band;
             T hi_val = qs[qorder[qstart + local_block - 1]] + band;
             da_int lo = static_cast<da_int>(
@@ -281,61 +315,82 @@ da_status snn_index<T>::radius_neighbors(
                 continue; /* no candidates for any query in this block */
             da_int band_size = hi - lo;
 
-            /* Gather the block's query rows (scattered by the sort) into a
-               contiguous column-major buffer with ld = local_block. */
-            for (da_int j = 0; j < nf; j++) {
-                T *dst = Qbuf.data() + static_cast<size_t>(j) * local_block;
-                const T *src = X_test + static_cast<size_t>(j) * ldx_test;
-                for (da_int qq = 0; qq < local_block; qq++)
-                    dst[qq] = src[qorder[qstart + qq]];
+            /* Split the query dimension so the distance block stays within
+               the cache budget (a single query with a very wide band still
+               needs band_size entries). */
+            da_int sub = std::max(da_int(1), SNN_D_BUDGET / band_size);
+            if (sub > local_block)
+                sub = local_block;
+            size_t need = static_cast<size_t>(band_size) * sub;
+            if (D.size() < need) {
+                try {
+                    D.resize(need);
+                } catch (std::bad_alloc const &) {
+#pragma omp atomic write
+                    threading_error = 1;
+                    continue;
+                }
             }
 
-            /* One BLAS-3 distance kernel call for the whole block over the
-               union band: D is (band_size x local_block), column-major,
-               D[ii + qq*band_size] = dist(X_sorted[lo+ii], query qq). Same
-               kernel and metric the brute path uses -> same substrate. */
-            try {
-                D.resize(static_cast<size_t>(band_size) * local_block);
-            } catch (std::bad_alloc const &) {
-#pragma omp atomic write
-                threading_error = 1;
-                continue;
-            }
-            da_status thd_status =
-                ARCH::da_metrics::pairwise_distances::pairwise_distance_kernel(
-                    da_order::column_major, band_size, local_block, nf,
-                    Xs_ptr + lo, ns, Qbuf.data(), local_block, D.data(),
-                    band_size, minkowski_p, metric);
-            if (thd_status != da_status_success) {
-#pragma omp atomic write
-                threading_error = 1;
-                continue;
-            }
+            for (da_int qoff = 0; qoff < local_block; qoff += sub) {
+                da_int nq = std::min(sub, local_block - qoff);
 
-            /* Per query: restrict to its own sub-band inside [lo, hi) -- by
-               the projection bound nothing outside it can be a neighbour --
-               then filter against the radius and translate sorted positions
-               back to original row indices. */
-            for (da_int qq = 0; qq < local_block; qq++) {
-                da_int orig = qorder[qstart + qq];
-                T q_lo = qs[orig] - band;
-                T q_hi = qs[orig] + band;
-                da_int l_i = static_cast<da_int>(
-                    std::lower_bound(scores_ptr + lo, scores_ptr + hi, q_lo) -
-                    scores_ptr);
-                da_int h_i = static_cast<da_int>(
-                    std::upper_bound(scores_ptr + lo, scores_ptr + hi, q_hi) -
-                    scores_ptr);
-                const T *Dcol = D.data() + static_cast<size_t>(qq) * band_size;
-                for (da_int ii = l_i - lo; ii < h_i - lo; ii++) {
-                    if (Dcol[ii] <= working_radius) {
-                        try {
-                            rnn_indices[orig].push_back(perm_ptr[lo + ii]);
-                            if (return_distances)
-                                rnn_distances[orig].push_back(Dcol[ii]);
-                        } catch (std::bad_alloc const &) {
+                /* Gather this sub-chunk's query rows (scattered by the sort)
+                   into a contiguous column-major buffer with ld = nq. */
+                for (da_int j = 0; j < nf; j++) {
+                    T *dst = Qbuf.data() + static_cast<size_t>(j) * nq;
+                    const T *src = X_test + static_cast<size_t>(j) * ldx_test;
+                    for (da_int qq = 0; qq < nq; qq++)
+                        dst[qq] = src[qorder[qstart + qoff + qq]];
+                }
+
+                /* One distance-kernel call for the sub-chunk over the union
+                   band: D is (band_size x nq), column-major. Same kernel and
+                   metric as the brute-force path -> same substrate. */
+                da_status thd_status =
+                    ARCH::da_metrics::pairwise_distances::pairwise_distance_kernel(
+                        da_order::column_major, band_size, nq, nf, Xs_ptr + lo,
+                        ns, Qbuf.data(), nq, D.data(), band_size, minkowski_p,
+                        metric);
+                if (thd_status != da_status_success) {
 #pragma omp atomic write
-                            threading_error = 1;
+                    threading_error = 1;
+                    break;
+                }
+
+                /* Per query: restrict to its own sub-band inside [lo, hi) --
+                   by the projection bound nothing outside it can be a
+                   neighbour -- then filter against the radius and translate
+                   sorted positions back to original row indices. */
+                for (da_int qq = 0; qq < nq; qq++) {
+                    da_int orig = qorder[qstart + qoff + qq];
+                    T q_lo = qs[orig] - band;
+                    T q_hi = qs[orig] + band;
+                    da_int l_i = static_cast<da_int>(
+                        std::lower_bound(scores_ptr + lo, scores_ptr + hi,
+                                         q_lo) -
+                        scores_ptr);
+                    da_int h_i = static_cast<da_int>(
+                        std::upper_bound(scores_ptr + lo, scores_ptr + hi,
+                                         q_hi) -
+                        scores_ptr);
+                    const T *Dcol =
+                        D.data() + static_cast<size_t>(qq) * band_size;
+                    for (da_int ii = l_i - lo; ii < h_i - lo; ii++) {
+                        if (Dcol[ii] <= working_radius) {
+                            /* The gemm distance identity ||a||^2 + ||b||^2 -
+                               2 a.b can round to a tiny NEGATIVE value for
+                               coincident points; unclamped it becomes NaN
+                               when the caller takes the square root. */
+                            T dval = Dcol[ii] > T(0) ? Dcol[ii] : T(0);
+                            try {
+                                rnn_indices[orig].push_back(perm_ptr[lo + ii]);
+                                if (return_distances)
+                                    rnn_distances[orig].push_back(dval);
+                            } catch (std::bad_alloc const &) {
+#pragma omp atomic write
+                                threading_error = 1;
+                            }
                         }
                     }
                 }
