@@ -90,7 +90,8 @@ inline da_status register_neighbors_options(da_options::OptionRegistry &opts,
             {{"auto", da_neighbors_types::automatic},
              {"brute", da_neighbors_types::brute},
              {"kd tree", da_neighbors_types::kd_tree},
-             {"ball tree", da_neighbors_types::ball_tree}},
+             {"ball tree", da_neighbors_types::ball_tree},
+             {"snn", da_neighbors_types::snn}},
             "auto"));
         opts.register_opt(os);
         os = std::make_shared<OptionString>(

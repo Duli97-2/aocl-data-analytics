@@ -333,19 +333,30 @@ template <typename T> da_status neighbors<T>::set_params() {
                             "Tree algorithms are not compatible with the Minkowski "
                             "metric when 0 < p < 1.");
         }
+    } else if (this->working_algo == da_neighbors_types::nn_algorithm::snn) {
+        // The SNN projection bound is an L2 bound, so only Euclidean-family
+        // metrics give exact results.
+        if (!(metric == da_euclidean || metric == da_euclidean_gemm ||
+              metric == da_sqeuclidean || metric == da_sqeuclidean_gemm ||
+              (metric == da_minkowski && p == (T)2.0))) {
+            return da_error(this->err, da_status_incompatible_options,
+                            "The snn algorithm requires a Euclidean-family metric "
+                            "(euclidean, sqeuclidean, euclidean_gemm, "
+                            "sqeuclidean_gemm, or minkowski with p = 2).");
+        }
     }
 
     if (metric == da_euclidean || (metric == da_minkowski && p == T(2.0)) ||
         metric == da_euclidean_gemm) {
         this->get_squares = true;
-        if (this->working_algo == brute) {
+        if (this->working_algo == brute || this->working_algo == da_neighbors_types::nn_algorithm::snn) {
             // If the algorithm is brute force, we need to use the squared Euclidean distance
             // to avoid computing the square root.
             if (metric == da_euclidean_gemm)
                 internal_metric = da_sqeuclidean_gemm;
             else
                 internal_metric = da_sqeuclidean;
-        }
+        } 
     }
 
     this->is_up_to_date = true;
@@ -392,6 +403,19 @@ template <typename T> da_status neighbors<T>::init_ball_tree() {
                         "Memory allocation failed.");
     }
     return da_status_success;
+}
+
+// Initialize the SNN index
+template <typename T> da_status neighbors<T>::init_snn() {
+    try {
+        this->internal_snn = std::make_unique<ARCH::da_snn::snn_index<T>>(
+            n_samples, n_features, X_train, ldx_train,
+            da_metric(this->internal_metric), this->p, this->err);
+    } catch (std::bad_alloc const &) {
+        return da_error(this->err, da_status_memory_error, // LCOV_EXCL_LINE
+                        "Memory allocation failed.");
+    }
+    return this->internal_snn->build();
 }
 
 // Check if the options have been updated between calls
@@ -506,6 +530,10 @@ da_status neighbors<T>::set_data(da_int n_samples, da_int n_features, const T *X
             return status;
     } else if (this->working_algo == da_neighbors_types::nn_algorithm::ball_tree) {
         status = neighbors<T>::init_ball_tree();
+        if (status != da_status_success)
+            return status;
+    } else if (this->working_algo == da_neighbors_types::nn_algorithm::snn) {
+        status = neighbors<T>::init_snn();
         if (status != da_status_success)
             return status;
     }
@@ -1943,6 +1971,10 @@ da_status neighbors<T>::radius_neighbors_compute(
         status = neighbors<T>::radius_neighbors_compute_ball_tree(
             n_queries, n_features, X_test, ldx_test, radius, rnn_indices, rnn_distances,
             return_distances);
+    } else if (this->working_algo == da_neighbors_types::nn_algorithm::snn) {
+        status = neighbors<T>::radius_neighbors_compute_snn(
+            n_queries, n_features, X_test, ldx_test, radius, rnn_indices, rnn_distances,
+            return_distances);
     } else {
         return da_error_bypass(this->err, da_status_invalid_input, // LCOV_EXCL_LINE
                                "Unknown algorithm: " + std::to_string(working_algo) +
@@ -2198,6 +2230,33 @@ da_status neighbors<T>::radius_neighbors_compute_ball_tree(
     return this->internal_ball_tree->radius_neighbors(
         n_queries, n_features, X_test, ldx_test, radius, rnn_indices, rnn_distances,
         return_distances, this->err);
+}
+
+// Compute kernel for the SNN algorithm
+template <typename T>
+da_status neighbors<T>::radius_neighbors_compute_snn(
+    da_int n_queries, da_int n_features, const T *X_test, da_int ldx_test, T radius,
+    std::vector<da_vector::da_vector<da_int>> &rnn_indices,
+    std::vector<da_vector::da_vector<T>> &rnn_distances, bool return_distances) {
+    if (!this->internal_snn) {
+        return da_error_bypass(
+            this->err, da_status_no_data,
+            "SNN index is not initialized. Please set the training data first.");
+    }
+    // The projection band needs a PLAIN Euclidean half-width; the distance
+    // filter needs a threshold in the kernel's own units. get_squares tells us
+    // which units the user's radius is in.
+    T band_eps, working_radius;
+    if (this->get_squares) {
+        band_eps = radius;                // user radius is plain Euclidean
+        working_radius = radius * radius; // kernel produces squared distances
+    } else {
+        working_radius = radius;          // sqeuclidean: radius already squared
+        band_eps = std::sqrt(radius);
+    }
+    return this->internal_snn->radius_neighbors(
+        n_queries, n_features, X_test, ldx_test, band_eps, working_radius, rnn_indices,
+        rnn_distances, return_distances, this->err);
 }
 
 // Return the number of radius neighbors for each query point

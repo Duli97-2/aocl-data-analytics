@@ -33,6 +33,7 @@
 #include "macros.h"
 #include "model_persistence.hpp"
 #include "nearest_neighbors_options.hpp"
+#include "snn.hpp"
 
 namespace ARCH {
 
@@ -93,6 +94,7 @@ template <typename T> class neighbors : public basic_handle<T> {
     // Internal tree objects to be initialized only when that options is requested
     std::unique_ptr<ARCH::da_binary_tree::kd_tree<T>> internal_kd_tree = nullptr;
     std::unique_ptr<ARCH::da_binary_tree::ball_tree<T>> internal_ball_tree = nullptr;
+    std::unique_ptr<ARCH::da_snn::snn_index<T>> internal_snn = nullptr;
     // For radius neighbors
     T radius = 1.0;
     std::vector<da_int> radius_neighbors_count;
@@ -124,6 +126,8 @@ template <typename T> class neighbors : public basic_handle<T> {
     da_status init_kd_tree();
     // Initialize the ball tree
     da_status init_ball_tree();
+    // Initialize the snn
+    da_status init_snn();
     // Check if the options have been updated between calls
     da_status check_options_update();
     // Set the training data (features)
@@ -227,6 +231,11 @@ template <typename T> class neighbors : public basic_handle<T> {
         da_int n_queries, da_int n_features, const T *X_test, da_int ldx_test, T radius,
         std::vector<da_vector::da_vector<da_int>> &rnn_indices,
         std::vector<da_vector::da_vector<T>> &rnn_distances, bool return_distance);
+    // Compute kernel for the SNN algorithm
+    da_status radius_neighbors_compute_snn(
+        da_int n_queries, da_int n_features, const T *X_test, da_int ldx_test, T radius,
+        std::vector<da_vector::da_vector<da_int>> &rnn_indices,
+        std::vector<da_vector::da_vector<T>> &rnn_distances, bool return_distances);
 
     // Return the number of radius neighbors for each query point
     da_status radius_neighbors_count_internal(da_int n_queries,

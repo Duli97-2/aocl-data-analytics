@@ -123,7 +123,8 @@ set(DA_NEAREST_NEIGHBORS_INTERNAL
     core/nearest_neighbors/radius_neighbors.cpp
     core/nearest_neighbors/kd_tree.cpp
     core/nearest_neighbors/ball_tree.cpp
-    core/nearest_neighbors/binary_tree.cpp)
+    core/nearest_neighbors/binary_tree.cpp
+    core/nearest_neighbors/snn.cpp)
 set(DA_CLUSTERING_INTERNAL
     core/clustering/kmeans.cpp core/clustering/dbscan.cpp
     core/clustering/kmeans_kernels.cpp)

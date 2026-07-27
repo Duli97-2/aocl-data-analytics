@@ -26,7 +26,7 @@
 
 namespace da_neighbors_types {
 
-enum nn_algorithm { brute = 0, kd_tree, ball_tree, automatic };
+enum nn_algorithm { brute = 0, kd_tree, ball_tree, automatic, snn };
 
 enum nn_weights { uniform = 0, distance };
 

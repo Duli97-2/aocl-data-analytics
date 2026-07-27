@@ -13,3 +13,4 @@ tags
 # Compiled Python
 *.pyc
 
+*:Zone.Identifier
