@@ -27,12 +27,15 @@
    its union band covers a large fraction of the index and almost all computed
    distances are discarded.
 
-   SNN_D_BUDGET caps the number of entries in the distance block so it stays
-   cache-resident; blocks whose union band is large are processed in
-   sub-chunks of queries rather than as one huge matrix. */
+   SNN_BAND_TILE tiles the CANDIDATE dimension. All of a block's queries are
+   processed against each band tile, so the tile's data is read once and
+   amortised over the whole block -- the same 2D blocking the brute-force
+   kernel uses. Chopping the QUERY dimension instead would re-read the entire
+   band for every few queries, which at high dimensionality costs far more in
+   memory traffic than the pruning saves. */
 #define SNN_MAX_QUERY_BLOCK da_int(256)
 #define SNN_SPAN_FACTOR T(1.0)
-#define SNN_D_BUDGET da_int(131072)
+#define SNN_BAND_TILE da_int(512)
 
 namespace ARCH {
 
@@ -283,9 +286,12 @@ da_status snn_index<T>::radius_neighbors(
     {
         da_int local_error = 0;
         std::vector<T> Qbuf, D;
+        std::vector<da_int> qlo, qhi;
         try {
             Qbuf.resize(static_cast<size_t>(SNN_MAX_QUERY_BLOCK) * nf);
-            D.resize(static_cast<size_t>(SNN_D_BUDGET));
+            D.resize(static_cast<size_t>(SNN_BAND_TILE) * SNN_MAX_QUERY_BLOCK);
+            qlo.resize(SNN_MAX_QUERY_BLOCK);
+            qhi.resize(SNN_MAX_QUERY_BLOCK);
         } catch (std::bad_alloc const &) {
 #pragma omp atomic write
             threading_error = 1;
@@ -313,80 +319,72 @@ da_status snn_index<T>::radius_neighbors(
                 scores_ptr);
             if (lo >= hi)
                 continue; /* no candidates for any query in this block */
-            da_int band_size = hi - lo;
 
-            /* Split the query dimension so the distance block stays within
-               the cache budget (a single query with a very wide band still
-               needs band_size entries). */
-            da_int sub = std::max(da_int(1), SNN_D_BUDGET / band_size);
-            if (sub > local_block)
-                sub = local_block;
-            size_t need = static_cast<size_t>(band_size) * sub;
-            if (D.size() < need) {
-                try {
-                    D.resize(need);
-                } catch (std::bad_alloc const &) {
-#pragma omp atomic write
-                    threading_error = 1;
-                    continue;
-                }
+            /* Gather the block's query rows (scattered by the sort) into a
+               contiguous column-major buffer ONCE, ld = local_block, and
+               resolve each query's own band once. Both are then reused by
+               every band tile below. */
+            for (da_int j = 0; j < nf; j++) {
+                T *dst = Qbuf.data() + static_cast<size_t>(j) * local_block;
+                const T *src = X_test + static_cast<size_t>(j) * ldx_test;
+                for (da_int qq = 0; qq < local_block; qq++)
+                    dst[qq] = src[qorder[qstart + qq]];
+            }
+            for (da_int qq = 0; qq < local_block; qq++) {
+                da_int orig = qorder[qstart + qq];
+                qlo[qq] = static_cast<da_int>(
+                    std::lower_bound(scores_ptr + lo, scores_ptr + hi,
+                                     qs[orig] - band) -
+                    scores_ptr);
+                qhi[qq] = static_cast<da_int>(
+                    std::upper_bound(scores_ptr + lo, scores_ptr + hi,
+                                     qs[orig] + band) -
+                    scores_ptr);
             }
 
-            for (da_int qoff = 0; qoff < local_block; qoff += sub) {
-                da_int nq = std::min(sub, local_block - qoff);
+            /* Tile the candidate dimension: each tile is read once and used
+               for every query in the block, so the cost of streaming the band
+               is amortised (2D blocking, as in the brute-force kernel). */
+            for (da_int tile_lo = lo; tile_lo < hi; tile_lo += SNN_BAND_TILE) {
+                da_int tile_hi = std::min(tile_lo + SNN_BAND_TILE, hi);
+                da_int tile_size = tile_hi - tile_lo;
 
-                /* Gather this sub-chunk's query rows (scattered by the sort)
-                   into a contiguous column-major buffer with ld = nq. */
-                for (da_int j = 0; j < nf; j++) {
-                    T *dst = Qbuf.data() + static_cast<size_t>(j) * nq;
-                    const T *src = X_test + static_cast<size_t>(j) * ldx_test;
-                    for (da_int qq = 0; qq < nq; qq++)
-                        dst[qq] = src[qorder[qstart + qoff + qq]];
-                }
-
-                /* One distance-kernel call for the sub-chunk over the union
-                   band: D is (band_size x nq), column-major. Same kernel and
-                   metric as the brute-force path -> same substrate. */
                 da_status thd_status =
                     ARCH::da_metrics::pairwise_distances::pairwise_distance_kernel(
-                        da_order::column_major, band_size, nq, nf, Xs_ptr + lo,
-                        ns, Qbuf.data(), nq, D.data(), band_size, minkowski_p,
-                        metric);
+                        da_order::column_major, tile_size, local_block, nf,
+                        Xs_ptr + tile_lo, ns, Qbuf.data(), local_block,
+                        D.data(), tile_size, minkowski_p, metric);
                 if (thd_status != da_status_success) {
 #pragma omp atomic write
                     threading_error = 1;
                     break;
                 }
 
-                /* Per query: restrict to its own sub-band inside [lo, hi) --
-                   by the projection bound nothing outside it can be a
-                   neighbour -- then filter against the radius and translate
-                   sorted positions back to original row indices. */
-                for (da_int qq = 0; qq < nq; qq++) {
-                    da_int orig = qorder[qstart + qoff + qq];
-                    T q_lo = qs[orig] - band;
-                    T q_hi = qs[orig] + band;
-                    da_int l_i = static_cast<da_int>(
-                        std::lower_bound(scores_ptr + lo, scores_ptr + hi,
-                                         q_lo) -
-                        scores_ptr);
-                    da_int h_i = static_cast<da_int>(
-                        std::upper_bound(scores_ptr + lo, scores_ptr + hi,
-                                         q_hi) -
-                        scores_ptr);
+                /* Per query: intersect its own band with this tile -- by the
+                   projection bound nothing outside its band can be a
+                   neighbour -- then filter and translate sorted positions
+                   back to original row indices. */
+                for (da_int qq = 0; qq < local_block; qq++) {
+                    da_int a = std::max(qlo[qq], tile_lo);
+                    da_int z = std::min(qhi[qq], tile_hi);
+                    if (a >= z)
+                        continue;
+                    da_int orig = qorder[qstart + qq];
                     const T *Dcol =
-                        D.data() + static_cast<size_t>(qq) * band_size;
-                    for (da_int ii = l_i - lo; ii < h_i - lo; ii++) {
-                        if (Dcol[ii] <= working_radius) {
-                            /* The gemm distance identity ||a||^2 + ||b||^2 -
-                               2 a.b can round to a tiny NEGATIVE value for
-                               coincident points; unclamped it becomes NaN
-                               when the caller takes the square root. */
-                            T dval = Dcol[ii] > T(0) ? Dcol[ii] : T(0);
+                        D.data() + static_cast<size_t>(qq) * tile_size;
+                    for (da_int ii = a; ii < z; ii++) {
+                        T dv = Dcol[ii - tile_lo];
+                        if (dv <= working_radius) {
+                            /* The gemm distance identity can round to a tiny
+                               NEGATIVE value for coincident points; unclamped
+                               it becomes NaN when the caller takes the square
+                               root. */
+                            if (dv < T(0))
+                                dv = T(0);
                             try {
-                                rnn_indices[orig].push_back(perm_ptr[lo + ii]);
+                                rnn_indices[orig].push_back(perm_ptr[ii]);
                                 if (return_distances)
-                                    rnn_distances[orig].push_back(dval);
+                                    rnn_distances[orig].push_back(dv);
                             } catch (std::bad_alloc const &) {
 #pragma omp atomic write
                                 threading_error = 1;
