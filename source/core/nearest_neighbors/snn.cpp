@@ -27,6 +27,24 @@
    its union band covers a large fraction of the index and almost all computed
    distances are discarded.
 
+   SNN_BLOCKS_PER_THREAD sets how many query blocks each thread should get,
+   but only below SNN_WIDE_FEATURES columns. The band tile is
+   (SNN_BAND_TILE x n_features) and is re-read once per query block, so
+   shrinking blocks to gain parallelism multiplies memory traffic by the same
+   factor. At 128 features that tile is half a megabyte and the trade clearly
+   favours more blocks; at 3072 it is twelve megabytes and the traffic
+   dominates, so wide data gets one block per thread instead. Measured on
+   fourteen datasets this rule picks the better of the two settings on twelve;
+   GloVe is the known exception, its band covering the whole index and so
+   behaving like much wider data than its 300 columns suggest.
+   The span rule alone can produce very few blocks when the radius is large
+   relative to the projection spread -- on SIFT it yields about four -- and the
+   OpenMP loop then runs on a fraction of the available threads while the
+   brute-force path, which blocks over both dimensions, uses all of them. The
+   block size is therefore also capped so that roughly this many blocks exist
+   per thread. Smaller blocks additionally tighten each union band, so the
+   total distance work does not increase.
+
    SNN_BAND_TILE tiles the CANDIDATE dimension. All of a block's queries are
    processed against each band tile, so the tile's data is read once and
    amortised over the whole block -- the same 2D blocking the brute-force
@@ -36,6 +54,8 @@
 #define SNN_MAX_QUERY_BLOCK da_int(256)
 #define SNN_SPAN_FACTOR T(1.0)
 #define SNN_BAND_TILE da_int(512)
+#define SNN_BLOCKS_PER_THREAD da_int(4)
+#define SNN_WIDE_FEATURES da_int(1024)
 
 namespace ARCH {
 
@@ -247,12 +267,23 @@ da_status snn_index<T>::radius_neighbors(
         return da_error(err, da_status_memory_error, // LCOV_EXCL_LINE
                         "Memory allocation failed.");
     }
+    /* get_n_threads_loop returns min(work, max threads), so passing the query
+       count (which comfortably exceeds any thread count) yields the maximum
+       available. */
+    da_int max_threads = ARCH::da_utils::get_n_threads_loop(n_queries);
+    da_int blocks_per_thread = (n_features >= SNN_WIDE_FEATURES)
+                                   ? da_int(1)
+                                   : SNN_BLOCKS_PER_THREAD;
+    da_int max_qblock =
+        std::min(SNN_MAX_QUERY_BLOCK,
+                 std::max(da_int(1),
+                          n_queries / (blocks_per_thread * max_threads)));
     {
         da_int i = 0;
         while (i < n_queries) {
             T base = qs[qorder[i]];
             da_int j = i + 1;
-            while (j < n_queries && (j - i) < SNN_MAX_QUERY_BLOCK &&
+            while (j < n_queries && (j - i) < max_qblock &&
                    (qs[qorder[j]] - base) <= SNN_SPAN_FACTOR * band)
                 j++;
             try {
@@ -282,16 +313,16 @@ da_status snn_index<T>::radius_neighbors(
     shared(threading_error, rnn_indices, rnn_distances, return_distances,        \
                n_qblocks, qs, qorder, bstart_ptr, scores_ptr, Xs_ptr, perm_ptr,  \
                ns, nf, minkowski_p, metric, band, working_radius, X_test,        \
-               ldx_test)
+               ldx_test, max_qblock)
     {
         da_int local_error = 0;
         std::vector<T> Qbuf, D;
         std::vector<da_int> qlo, qhi;
         try {
-            Qbuf.resize(static_cast<size_t>(SNN_MAX_QUERY_BLOCK) * nf);
-            D.resize(static_cast<size_t>(SNN_BAND_TILE) * SNN_MAX_QUERY_BLOCK);
-            qlo.resize(SNN_MAX_QUERY_BLOCK);
-            qhi.resize(SNN_MAX_QUERY_BLOCK);
+            Qbuf.resize(static_cast<size_t>(max_qblock) * nf);
+            D.resize(static_cast<size_t>(SNN_BAND_TILE) * max_qblock);
+            qlo.resize(max_qblock);
+            qhi.resize(max_qblock);
         } catch (std::bad_alloc const &) {
 #pragma omp atomic write
             threading_error = 1;

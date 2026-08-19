@@ -368,7 +368,7 @@ da_status binary_tree<Derived, NodeType>::k_neighbors(da_int m_samples_in,
             auto heap = MaxHeap<T>(k, &k_ind[i * k], &k_dist[i * k]);
 
             da_status tmp_status = static_cast<Derived *>(this)->k_neighbors_recursive(
-                this->root, &X_row[X_row_index], k, X_is_A, i, X_norm, heap);
+                this->root.get(), &X_row[X_row_index], k, X_is_A, i, X_norm, heap);
             if (tmp_status != da_status_success) {
 // If there was an error, set the status and break out of the loop
 #pragma omp atomic write
@@ -474,11 +474,11 @@ da_status binary_tree<Derived, NodeType>::radius_neighbors_loop(
             da_status tmp_status;
             if constexpr (ReturnDistances) {
                 tmp_status = static_cast<Derived *>(this)->radius_neighbors_recursive(
-                    this->root, &X_row[X_row_index], eps, eps_internal, neighbors[i],
+                    this->root.get(), &X_row[X_row_index], eps, eps_internal, neighbors[i],
                     distances[i], true, X_is_A, i, X_norm);
             } else {
                 tmp_status = static_cast<Derived *>(this)->radius_neighbors_recursive(
-                    this->root, &X_row[X_row_index], eps, eps_internal, neighbors[i],
+                    this->root.get(), &X_row[X_row_index], eps, eps_internal, neighbors[i],
                     dummy_dist, false, X_is_A, i, X_norm);
             }
             if (tmp_status != da_status_success) {
@@ -499,7 +499,7 @@ const std::vector<da_int> &binary_tree<Derived, NodeType>::get_indices() {
 
 template <typename Derived, typename NodeType>
 da_status binary_tree<Derived, NodeType>::tree_serialization(
-    da_model_persistence::serialization_buffer &buffer, std::shared_ptr<NodeType> &node) {
+    da_model_persistence::serialization_buffer &buffer, std::unique_ptr<NodeType> &node) {
     da_status status = da_status_success;
     bool node_exists = (node != nullptr);
 
@@ -528,7 +528,7 @@ da_status binary_tree<Derived, NodeType>::tree_serialization(
     if (node == nullptr &&
         buffer.get_mode() == da_model_persistence::buffer_mode::deserialize) {
         try {
-            node = std::make_shared<NodeType>();
+            node = std::make_unique<NodeType>();
         } catch (std::bad_alloc const &) {
             return da_status_memory_error; // LCOV_EXCL_LINE
         }

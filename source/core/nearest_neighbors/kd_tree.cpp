@@ -241,7 +241,7 @@ T kd_tree<T>::single_pass_variance(da_int *indices, da_int n_indices, da_int dim
 // Recursive function to build the k-d tree
 // The k-d tree is built in a top-down manner, starting from the root node and recursively splitting
 template <typename T>
-std::shared_ptr<kd_node<T>>
+std::unique_ptr<kd_node<T>>
 kd_tree<T>::build_tree(da_int depth, da_int *indices, da_int n_indices,
                        std::vector<T> *min_bounds, std::vector<T> *max_bounds,
                        da_int root_dim) {
@@ -256,8 +256,8 @@ kd_tree<T>::build_tree(da_int depth, da_int *indices, da_int n_indices,
     // Create a new node for this part of the tree, with sensible defaults. Only the root node will have
     // min_bounds and max_bounds supplied; for all other nodes these will be computed later
     auto this_node = (min_bounds == nullptr)
-                         ? std::make_shared<kd_node<T>>(dim, depth, indices, n_indices)
-                         : std::make_shared<kd_node<T>>(dim, depth, indices, n_indices,
+                         ? std::make_unique<kd_node<T>>(dim, depth, indices, n_indices)
+                         : std::make_unique<kd_node<T>>(dim, depth, indices, n_indices,
                                                         *min_bounds, *max_bounds);
 
     // If needed compute the bounding box for the node
@@ -315,12 +315,17 @@ kd_tree<T>::build_tree(da_int depth, da_int *indices, da_int n_indices,
 
     // Recursively build the left and right child nodes, but only spawn tasks if the workload is large enough
     if (mid > KD_TREE_MIN_TASK_SIZE) {
+        // firstprivate copies its arguments, and unique_ptr is move-only, so capture a
+        // non-owning raw pointer. This is safe: moving a unique_ptr transfers ownership
+        // but never relocates the pointed-to object, so node_ptr stays valid for the
+        // lifetime of the tree.
+        kd_node<T> *node_ptr = this_node.get();
         // Some older compilers don't like the use of "omp task if" so use an explicit if statement
-#pragma omp task firstprivate(depth, mid, indices, this_node)
-        { this_node->left_child = build_tree(depth + 1, indices, mid); }
-#pragma omp task firstprivate(depth, mid, indices, n_indices, this_node)
+#pragma omp task firstprivate(depth, mid, indices, node_ptr)
+        { node_ptr->left_child = build_tree(depth + 1, indices, mid); }
+#pragma omp task firstprivate(depth, mid, indices, n_indices, node_ptr)
         {
-            this_node->right_child =
+            node_ptr->right_child =
                 build_tree(depth + 1, indices + mid + 1, n_indices - mid - 1);
         }
     } else {
@@ -334,7 +339,7 @@ kd_tree<T>::build_tree(da_int depth, da_int *indices, da_int n_indices,
 
 // Recursive function to find the radius neighbors of a point (determined by index_X) in X
 template <typename T>
-da_status kd_tree<T>::radius_neighbors_recursive(std::shared_ptr<kd_node<T>> current_node,
+da_status kd_tree<T>::radius_neighbors_recursive(kd_node<T> *current_node,
                                                  T *X, T eps, T eps_internal,
                                                  da_vector::da_vector<da_int> &neighbors,
                                                  da_vector::da_vector<T> &distances,
@@ -425,13 +430,13 @@ da_status kd_tree<T>::radius_neighbors_recursive(std::shared_ptr<kd_node<T>> cur
 
         if (diff <= eps) {
             // Check the left child
-            radius_neighbors_recursive(current_node->left_child, X, eps, eps_internal,
+            radius_neighbors_recursive(current_node->left_child.get(), X, eps, eps_internal,
                                        neighbors, distances, return_distance, X_is_A,
                                        index_X, X_norm);
         }
         if (diff >= -eps) {
             // Check the right child
-            radius_neighbors_recursive(current_node->right_child, X, eps, eps_internal,
+            radius_neighbors_recursive(current_node->right_child.get(), X, eps, eps_internal,
                                        neighbors, distances, return_distance, X_is_A,
                                        index_X, X_norm);
         }
@@ -441,7 +446,7 @@ da_status kd_tree<T>::radius_neighbors_recursive(std::shared_ptr<kd_node<T>> cur
 
 // Recursive function to find the k nearest neighbors of a point (determined by index_X) in X
 template <typename T>
-da_status kd_tree<T>::k_neighbors_recursive(std::shared_ptr<kd_node<T>> current_node,
+da_status kd_tree<T>::k_neighbors_recursive(kd_node<T> *current_node,
                                             T *X, da_int k, bool X_is_A, da_int index_X,
                                             T X_norm, MaxHeap<T> &heap) {
 
@@ -507,22 +512,22 @@ da_status kd_tree<T>::k_neighbors_recursive(std::shared_ptr<kd_node<T>> current_
 
         if (diff < (T)0.0) {
             // Check the left child first
-            k_neighbors_recursive(current_node->left_child, X, k, X_is_A, index_X, X_norm,
+            k_neighbors_recursive(current_node->left_child.get(), X, k, X_is_A, index_X, X_norm,
                                   heap);
 
             if (diff_tmp >= -heap.GetMaxDist()) {
                 // Check the right child
-                k_neighbors_recursive(current_node->right_child, X, k, X_is_A, index_X,
+                k_neighbors_recursive(current_node->right_child.get(), X, k, X_is_A, index_X,
                                       X_norm, heap);
             }
         } else {
             // Check the right child first
-            k_neighbors_recursive(current_node->right_child, X, k, X_is_A, index_X,
+            k_neighbors_recursive(current_node->right_child.get(), X, k, X_is_A, index_X,
                                   X_norm, heap);
 
             if (diff_tmp <= heap.GetMaxDist()) {
                 // Check the left child
-                k_neighbors_recursive(current_node->left_child, X, k, X_is_A, index_X,
+                k_neighbors_recursive(current_node->left_child.get(), X, k, X_is_A, index_X,
                                       X_norm, heap);
             }
         }
