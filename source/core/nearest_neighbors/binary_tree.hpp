@@ -236,6 +236,19 @@ template <typename T> class kd_tree : public binary_tree<kd_tree<T>, kd_node<T>>
                                     da_int k, bool X_is_A, da_int index_X, T X_norm,
                                     MaxHeap<T> &heap);
 
+        // Root accessor: the dual traversal needs the query tree's root from
+    // outside that instance. Avoids relying on [class.protected] access
+    // through a sibling object.
+    kd_node<T> *get_root() { return this->root.get(); }
+
+    // Dual-tree k-nearest-neighbour search. Signature mirrors
+    // binary_tree::k_neighbors so the two can be swapped at the call site.
+    // Requires X_in != nullptr (bichromatic query set).
+    da_status k_neighbors_dual(da_int m_samples_in, da_int m_features_in,
+                               const T *X_in, da_int ldx_in, da_int k,
+                               da_int *k_ind, T *k_dist, da_int query_leaf_size,
+                               da_errors::da_error_t *err);
+
   private:
     // Build the k-d tree from the dataset
     std::unique_ptr<kd_node<T>> build_tree(da_int depth, da_int *indices,
@@ -247,6 +260,22 @@ template <typename T> class kd_tree : public binary_tree<kd_tree<T>, kd_node<T>>
     da_neighbors_types::nn_check_region check_bounding_box(T *X, T eps,
                                                            std::vector<T> &min_bounds,
                                                            std::vector<T> &max_bounds);
+
+    // Minimum distance between two axis-aligned boxes. Mirrors
+    // check_bounding_box's metric handling and its early exit on eps.
+    T box_min_dist(const std::vector<T> &q_min, const std::vector<T> &q_max,
+                   const std::vector<T> &r_min, const std::vector<T> &r_max,
+                   T eps);
+
+    // Largest k-th candidate distance over all queries beneath q_node, or
+    // T max if any heap is not yet full (in which case nothing may be pruned).
+    T query_node_bound(kd_node<T> *q_node, da_int k,
+                       std::vector<MaxHeap<T>> &heaps);
+
+    da_status k_neighbors_dual_recursive(kd_node<T> *q_node, kd_node<T> *r_node,
+                                         da_int k, std::vector<T> &Q_rows,
+                                         std::vector<T> &Q_norms,
+                                         std::vector<MaxHeap<T>> &heaps);
 };
 
 template <typename T>

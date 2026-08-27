@@ -623,6 +623,187 @@ kd_tree<T>::check_bounding_box(T *X, T eps, std::vector<T> &min_bounds,
     return da_neighbors_types::pt_outside_eps;
 }
 
+/* Minimum distance between the box [q_min, q_max] and the box [r_min, r_max].
+ * Per dimension the gap is max(0, q_min - r_max, r_min - q_max); it is zero
+ * when the projections overlap. Returns the same quantity check_bounding_box
+ * returns for a point (squared for the Euclidean family), so it is directly
+ * comparable against heap.GetMaxDist().
+ */
+template <typename T>
+T kd_tree<T>::box_min_dist(const std::vector<T> &q_min, const std::vector<T> &q_max,
+                           const std::vector<T> &r_min, const std::vector<T> &r_max,
+                           T eps) {
+    T min_dist = 0.0;
+
+    if ((this->metric == da_euclidean) || (this->metric == da_euclidean_gemm)) {
+        for (da_int i = 0; i < this->n_features; i++) {
+            T gap = std::max(std::max(q_min[i] - r_max[i], r_min[i] - q_max[i]), T(0.0));
+            min_dist += gap * gap;
+            if (min_dist > eps)
+                return min_dist; // early exit, as check_bounding_box does
+        }
+    } else if (this->metric == da_manhattan) {
+        for (da_int i = 0; i < this->n_features; i++) {
+            T gap = std::max(std::max(q_min[i] - r_max[i], r_min[i] - q_max[i]), T(0.0));
+            min_dist += gap;
+            if (min_dist > eps)
+                return min_dist;
+        }
+    } else {
+        for (da_int i = 0; i < this->n_features; i++) {
+            T gap = std::max(std::max(q_min[i] - r_max[i], r_min[i] - q_max[i]), T(0.0));
+            min_dist += std::pow(gap, this->p);
+        }
+        min_dist = std::pow(min_dist, this->p_inv);
+    }
+
+    return min_dist;
+}
+
+/* Largest k-th candidate distance over every query beneath q_node.
+ * If any heap is not yet full that query could still accept an arbitrarily
+ * distant point, so no reference subtree may be pruned for this query node.
+ */
+template <typename T>
+T kd_tree<T>::query_node_bound(kd_node<T> *q_node, da_int k,
+                               std::vector<MaxHeap<T>> &heaps) {
+    T bound = 0.0;
+    for (da_int t = 0; t < q_node->n_indices; t++) {
+        da_int qi = q_node->indices[t];
+        if (heaps[qi].GetSize() < k)
+            return std::numeric_limits<T>::max();
+        bound = std::max(bound, heaps[qi].GetMaxDist());
+    }
+    return bound;
+}
+
+/* Dual traversal. See the three-group decomposition in the design note. */
+template <typename T>
+da_status kd_tree<T>::k_neighbors_dual_recursive(kd_node<T> *q_node,
+                                                 kd_node<T> *r_node, da_int k,
+                                                 std::vector<T> &Q_rows,
+                                                 std::vector<T> &Q_norms,
+                                                 std::vector<MaxHeap<T>> &heaps) {
+    da_status status = da_status_success;
+    const da_int nf = this->n_features;
+
+    // Prune the whole reference subtree for every query beneath q_node.
+    T bound = query_node_bound(q_node, k, heaps);
+    if (bound < std::numeric_limits<T>::max()) {
+        if (box_min_dist(q_node->min_bounds, q_node->max_bounds, r_node->min_bounds,
+                         r_node->max_bounds, bound) > bound)
+            return da_status_success;
+    }
+
+    // Once either side cannot be split further, fall back to the existing
+    // single-tree traversal rooted at r_node. Correct by inheritance.
+    if (q_node->is_leaf || r_node->is_leaf) {
+        for (da_int t = 0; t < q_node->n_indices; t++) {
+            da_int qi = q_node->indices[t];
+            status = k_neighbors_recursive(r_node, &Q_rows[qi * nf], k, false, qi,
+                                           Q_norms[qi], heaps[qi]);
+            if (status != da_status_success)
+                return status;
+        }
+        return da_status_success;
+    }
+
+    // ---- group 1: r_node's own point against every query beneath q_node ----
+    {
+        da_int index_A = r_node->point;
+        for (da_int t = 0; t < q_node->n_indices; t++) {
+            da_int qi = q_node->indices[t];
+            T dist;
+            status = this->compute_distance(dist, index_A, &Q_rows[qi * nf],
+                                            Q_norms[qi]);
+            if (status != da_status_success)
+                return status;
+            heaps[qi].Insert(index_A, dist);
+        }
+    }
+
+    // ---- group 2: q_node's own point against r_node's two subtrees ----
+    // r_node's own point is already covered by group 1, so descend past it.
+    {
+        da_int qi = q_node->point;
+        status = k_neighbors_recursive(r_node->left_child.get(), &Q_rows[qi * nf], k,
+                                       false, qi, Q_norms[qi], heaps[qi]);
+        if (status != da_status_success)
+            return status;
+        status = k_neighbors_recursive(r_node->right_child.get(), &Q_rows[qi * nf], k,
+                                       false, qi, Q_norms[qi], heaps[qi]);
+        if (status != da_status_success)
+            return status;
+    }
+
+    // ---- group 3: four-way dual descent ----
+    kd_node<T> *qc[2] = {q_node->left_child.get(), q_node->right_child.get()};
+    kd_node<T> *rc[2] = {r_node->left_child.get(), r_node->right_child.get()};
+    for (da_int a = 0; a < 2; a++) {
+        for (da_int b = 0; b < 2; b++) {
+            status = k_neighbors_dual_recursive(qc[a], rc[b], k, Q_rows, Q_norms, heaps);
+            if (status != da_status_success)
+                return status;
+        }
+    }
+
+    return da_status_success;
+}
+
+/* Driver. Builds the query tree, gathers query rows into a contiguous
+ * row-major buffer, constructs one persistent heap per query over the caller's
+ * output arrays, and runs the dual traversal from (query root, reference root).
+ */
+template <typename T>
+da_status kd_tree<T>::k_neighbors_dual(da_int m_samples_in, da_int m_features_in,
+                                       const T *X_in, da_int ldx_in, da_int k,
+                                       da_int *k_ind, T *k_dist,
+                                       da_int query_leaf_size,
+                                       da_errors::da_error_t *err) {
+    if (X_in == nullptr)
+        return da_error(err, da_status_invalid_input,
+                        "Dual-tree k-neighbors requires an explicit query set.");
+    if (m_features_in != this->n_features)
+        return da_error(err, da_status_invalid_input,
+                        "Number of features in X does not match the tree.");
+
+    const da_int nq = m_samples_in;
+    const da_int nf = this->n_features;
+
+    std::vector<T> Q_rows, Q_norms;
+    std::vector<MaxHeap<T>> heaps;
+    try {
+        Q_rows.resize(static_cast<size_t>(nq) * nf);
+        Q_norms.resize(nq, T(0.0));
+        heaps.reserve(nq);
+    } catch (std::bad_alloc const &) {
+        return da_error(err, da_status_memory_error, "Memory allocation failed.");
+    }
+
+    // Gather query rows contiguously and precompute norms (the gemm path needs
+    // them; other metrics ignore the value).
+    for (da_int i = 0; i < nq; i++) {
+        T norm = 0.0;
+        for (da_int j = 0; j < nf; j++) {
+            T v = X_in[i + j * ldx_in];
+            Q_rows[static_cast<size_t>(i) * nf + j] = v;
+            norm += v * v;
+        }
+        if (this->metric == da_euclidean_gemm)
+            Q_norms[i] = norm;
+        heaps.emplace_back(MaxHeap<T>(k, &k_ind[i * k], &k_dist[i * k]));
+    }
+
+    try {
+               auto qtree = kd_tree<T>(nq, nf, X_in, ldx_in, query_leaf_size, this->metric,
+                                this->p);
+        return k_neighbors_dual_recursive(qtree.get_root(), this->root.get(), k, Q_rows,
+                                          Q_norms, heaps);
+    } catch (std::bad_alloc const &) {
+        return da_error(err, da_status_memory_error, "Memory allocation failed.");
+    }
+}
+
 // Explicit instantiation of the k-d tree class for double and float types
 
 template class kd_tree<double>;

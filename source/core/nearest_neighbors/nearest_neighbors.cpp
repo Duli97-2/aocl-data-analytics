@@ -928,8 +928,21 @@ da_status neighbors<T>::kneighbors_compute_kd_tree(da_int n_queries, da_int n_fe
         return da_error(this->err, da_status_memory_error, // LCOV_EXCL_LINE
                         "Memory allocation failed.");
     }
-    this->internal_kd_tree->k_neighbors(n_queries, n_features, X_test, ldx_test, n_neigh,
-                                        k_ind.data(), k_dist.data(), this->err);
+        // Research switch: set DA_DUAL_TREE=1 to route kd-tree kNN through the
+    // dual traversal. Read once per process; no per-query cost.
+    static const bool use_dual_tree = (std::getenv("DA_DUAL_TREE") != nullptr);
+    da_status tree_status;
+    if (use_dual_tree) {
+        tree_status = this->internal_kd_tree->k_neighbors_dual(
+            n_queries, n_features, X_test, ldx_test, n_neigh, k_ind.data(),
+            k_dist.data(), /*query_leaf_size=*/30, this->err);
+    } else {
+        tree_status = this->internal_kd_tree->k_neighbors(
+            n_queries, n_features, X_test, ldx_test, n_neigh, k_ind.data(),
+            k_dist.data(), this->err);
+    }
+    if (tree_status != da_status_success)
+        return tree_status;
 
     // k_neighbors() does not sort the indices and distances, so we need to do it here.
     for (da_int k = 0; k < n_queries; k++) {
