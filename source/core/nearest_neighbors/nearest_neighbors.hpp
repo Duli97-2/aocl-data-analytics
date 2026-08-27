@@ -34,6 +34,7 @@
 #include "model_persistence.hpp"
 #include "nearest_neighbors_options.hpp"
 #include "snn.hpp"
+#include "nearest_neighbors_heuristic.hpp"
 
 namespace ARCH {
 
@@ -264,6 +265,17 @@ template <typename T> class neighbors : public basic_handle<T> {
     // Assumes column-major order.
     da_status predict_targets_rnn(da_int n_queries, da_int n_features, const T *X_test,
                                   da_int ldx_test, T *y_test);
+
+    // Algorithm chosen for the current radius query when algorithm=auto.
+    // Distinct from working_algo, which is fixed at set_params() time and is
+    // also used by the kNN path.
+    da_int radius_algo = da_neighbors_types::nn_algorithm::automatic;
+
+    da_status init_radius_indices();
+    
+    // Refine the algorithm choice once the query radius is known.
+    void refine_radius_algorithm(da_int n_queries, const T *X_test,
+                                 da_int ldx_test, T r);
 };
 
 } // namespace da_neighbors

@@ -25,6 +25,8 @@
  *
  */
 
+#include <cstdio>
+#include <cstdlib>
 #include "nearest_neighbors.hpp"
 #include "basic_statistics.hpp"
 #include "da_cblas.hh"
@@ -363,6 +365,22 @@ template <typename T> da_status neighbors<T>::set_params() {
     return da_status_success;
 }
 
+/*// Chose the appropriate algorithm if auto is selected
+template <typename T> void neighbors<T>::set_neighbors_algorithm() {
+    if ((this->metric == da_cosine) || (this->metric == da_sqeuclidean) ||
+        (this->metric == da_minkowski && this->p < (T)1.0) ||
+        (this->metric == da_sqeuclidean_gemm)) { // LCOV_EXCL_LINE
+        this->working_algo = da_neighbors_types::nn_algorithm::brute;
+    } else {
+        // If the number of features is small and the number of samples is large, use k-d tree
+        if (this->n_features < 10 && this->n_samples > 100000) { // LCOV_EXCL_LINE
+            this->working_algo = da_neighbors_types::nn_algorithm::kd_tree;
+        } else {
+            this->working_algo = da_neighbors_types::nn_algorithm::brute;
+        }
+    }
+}*/
+
 // Chose the appropriate algorithm if auto is selected
 template <typename T> void neighbors<T>::set_neighbors_algorithm() {
     if ((this->metric == da_cosine) || (this->metric == da_sqeuclidean) ||
@@ -376,6 +394,33 @@ template <typename T> void neighbors<T>::set_neighbors_algorithm() {
         } else {
             this->working_algo = da_neighbors_types::nn_algorithm::brute;
         }
+    }
+
+    // Radius search has a separate cost model: SNN's projection filter is
+    // exact for Euclidean-family metrics and usually beats brute force, but
+    // the choice depends on the query radius, which is not known here. Record
+    // the radius-free part now; refine_radius_algorithm() completes it.
+    this->radius_algo = heuristic::select_radius_algorithm_static<T>(
+        this->n_samples, this->n_features, this->metric, this->p);
+}
+
+// Refine the radius-search algorithm now that the query radius is known.
+// Only meaningful when algorithm=auto; an explicit choice is always honoured.
+template <typename T>
+void neighbors<T>::refine_radius_algorithm(da_int n_queries, const T *X_test,
+                                           da_int ldx_test, T r) {
+    if (this->algo != da_neighbors_types::nn_algorithm::automatic)
+        return;
+    this->radius_algo = heuristic::select_radius_algorithm<T>(
+        this->n_samples, this->n_features, this->X_train, this->ldx_train,
+        n_queries, X_test, ldx_test, r, this->metric, this->p);
+
+    if (std::getenv("AOCLDA_LOG_ALGO")) {
+        static const char *nm[] = {"brute", "kd tree", "ball tree", "auto", "snn"};
+        std::fprintf(stderr, "[auto] n=%lld d=%lld R=%g -> %s\n",
+                     (long long)this->n_samples, (long long)this->n_features,
+                     (double)r, nm[this->radius_algo]);
+        std::fflush(stderr);
     }
 }
 
@@ -416,6 +461,47 @@ template <typename T> da_status neighbors<T>::init_snn() {
                         "Memory allocation failed.");
     }
     return this->internal_snn->build();
+}
+
+// Build whichever indices the radius-search rule may dispatch to. working_algo
+// governs the kNN path and is built separately in set_data(); radius search
+// selects independently, so its indices must exist before the first query.
+// Which ones are needed follows from the rule in nearest_neighbors_heuristic.hpp:
+//   d <= 5                 -> k-d tree only
+//   5 < d <= 10            -> k-d tree or SNN, depending on the band
+//   d > 10                 -> SNN or brute (brute needs no index)
+template <typename T> da_status neighbors<T>::init_radius_indices() {
+    if (this->algo != da_neighbors_types::nn_algorithm::automatic)
+        return da_status_success;   // explicit choice: set_data() already built it
+    if (!heuristic::metric_supports_snn<T>(this->metric, this->p))
+        return da_status_success;   // brute only; nothing to build
+
+    da_status status = da_status_success;
+    const bool want_kd = (this->n_features <= heuristic::KD_BAND_MAX_DIM) &&
+                         heuristic::metric_supports_tree<T>(this->metric, this->p);
+    const bool want_snn = (this->n_features > heuristic::KD_MAX_DIM);
+
+    if (want_kd && this->internal_kd_tree == nullptr) {
+        // internal_metric may have been switched to a SQUARED variant because
+        // working_algo is brute or snn (see set_params). Tree traversal is not
+        // written for squared metrics -- set_params rejects that combination on
+        // the explicit path -- so build from the user's metric instead. The
+        // query radius arrives in those same units, so the two agree.
+        try {
+            this->internal_kd_tree = std::make_unique<ARCH::da_binary_tree::kd_tree<T>>(
+                this->n_samples, this->n_features, this->X_train, this->ldx_train,
+                this->leaf_size, da_metric(this->metric), this->p);
+        } catch (std::bad_alloc const &) {
+            return da_error(this->err, da_status_memory_error, // LCOV_EXCL_LINE
+                            "Memory allocation failed.");
+        }
+    }
+    if (want_snn && this->internal_snn == nullptr) {
+        status = neighbors<T>::init_snn();
+        if (status != da_status_success)
+            return status;
+    }
+    return da_status_success;
 }
 
 // Check if the options have been updated between calls
@@ -536,7 +622,18 @@ da_status neighbors<T>::set_data(da_int n_samples, da_int n_features, const T *X
         status = neighbors<T>::init_snn();
         if (status != da_status_success)
             return status;
+    } else if (this->working_algo == da_neighbors_types::nn_algorithm::snn) {
+        status = neighbors<T>::init_snn();
+        if (status != da_status_success)
+            return status;
     }
+
+    // Radius search chooses its algorithm independently of working_algo.
+    status = neighbors<T>::init_radius_indices();
+    if (status != da_status_success)
+        return status;
+
+    this->istrained_Xtrain = true;
     this->istrained_Xtrain = true;
     return da_status_success;
 }
@@ -1917,6 +2014,9 @@ da_status neighbors<T>::radius_neighbors(da_int n_queries, da_int n_features,
         r = this->radius;
     }
 
+    // Choose the radius-search algorithm now that r is known.
+    refine_radius_algorithm(n_queries, X_test_temp, ldx_test_temp, r);
+
     status = neighbors<T>::radius_neighbors_compute(
         n_queries, n_features, X_test_temp, ldx_test_temp, r,
         this->radius_neighbors_count, this->radius_neighbors_indices,
@@ -1958,26 +2058,48 @@ da_status neighbors<T>::radius_neighbors_compute(
         return da_error(this->err, da_status_memory_error, // LCOV_EXCL_LINE
                         "Memory allocation failed.");
     }
+
+    // Radius search selects its own algorithm. working_algo is fixed when
+    // set_params() runs, before the query radius is known, and is shared with
+    // the kNN path; radius_algo is set by refine_radius_algorithm() once the
+    // radius is available. Fall back to working_algo when the refinement has
+    // not run - the prediction paths call this kernel directly.
+    da_int use_algo =
+        (this->radius_algo == da_neighbors_types::nn_algorithm::automatic)
+            ? this->working_algo
+            : this->radius_algo;
+
+        // Late safety net: if the chosen index was never built, fall back rather
+    // than dereferencing null.
+    if ((use_algo == da_neighbors_types::nn_algorithm::kd_tree &&
+         this->internal_kd_tree == nullptr) ||
+        (use_algo == da_neighbors_types::nn_algorithm::ball_tree &&
+         this->internal_ball_tree == nullptr) ||
+        (use_algo == da_neighbors_types::nn_algorithm::snn &&
+         this->internal_snn == nullptr)) {
+        use_algo = da_neighbors_types::nn_algorithm::brute;
+    }
+
     da_status status = da_status_success;
-    if (this->working_algo == da_neighbors_types::nn_algorithm::brute) {
+    if (use_algo == da_neighbors_types::nn_algorithm::brute) {
         status = neighbors<T>::radius_neighbors_compute_brute_force(
             n_queries, n_features, X_test, ldx_test, radius, rnn_indices, rnn_distances,
             return_distances);
-    } else if (this->working_algo == da_neighbors_types::nn_algorithm::kd_tree) {
+    } else if (use_algo == da_neighbors_types::nn_algorithm::kd_tree) {
         status = neighbors<T>::radius_neighbors_compute_kd_tree(
             n_queries, n_features, X_test, ldx_test, radius, rnn_indices, rnn_distances,
             return_distances);
-    } else if (this->working_algo == da_neighbors_types::nn_algorithm::ball_tree) {
+    } else if (use_algo == da_neighbors_types::nn_algorithm::ball_tree) {
         status = neighbors<T>::radius_neighbors_compute_ball_tree(
             n_queries, n_features, X_test, ldx_test, radius, rnn_indices, rnn_distances,
             return_distances);
-    } else if (this->working_algo == da_neighbors_types::nn_algorithm::snn) {
+    } else if (use_algo == da_neighbors_types::nn_algorithm::snn) {
         status = neighbors<T>::radius_neighbors_compute_snn(
             n_queries, n_features, X_test, ldx_test, radius, rnn_indices, rnn_distances,
             return_distances);
     } else {
         return da_error_bypass(this->err, da_status_invalid_input, // LCOV_EXCL_LINE
-                               "Unknown algorithm: " + std::to_string(working_algo) +
+                               "Unknown algorithm: " + std::to_string(use_algo) +
                                    ".");
     }
 
