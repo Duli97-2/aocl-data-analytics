@@ -25,6 +25,7 @@
 #include "binary_tree.hpp"
 #include "da_omp.hpp"
 #include "da_std.hpp"
+#include "tree_counters.hpp"
 #include <algorithm>
 #include <limits>
 #include <stack>
@@ -449,8 +450,8 @@ template <typename T>
 da_status kd_tree<T>::k_neighbors_recursive(kd_node<T> *current_node,
                                             T *X, da_int k, bool X_is_A, da_int index_X,
                                             T X_norm, MaxHeap<T> &heap) {
-
     da_status status = da_status_success;
+    DA_COUNT_NODE();
 
     // If the heap is full we need to check the bounding box, otherwise we can skip this check
     da_neighbors_types::nn_check_region proximity =

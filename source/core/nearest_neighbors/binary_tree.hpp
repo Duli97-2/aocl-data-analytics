@@ -196,6 +196,12 @@ template <typename Derived, typename NodeType> class binary_tree {
     // Row norms of the dataset - only used for da_euclidean
     std::vector<T> A_norms;
 
+    // Row-major copy of the training data, built in store_data. Present only
+    // when use_A_rowmajor is true; see the note there for why it is optional.
+    // Deliberately not named A_row -- ball_tree already has A_row1/A_row2.
+    std::vector<T> A_rowmajor;
+    bool use_A_rowmajor = false;
+
     // Root node of the tree
     std::unique_ptr<NodeType> root = nullptr;
 
